@@ -1,0 +1,186 @@
+name: DORA Metrics
+
+on:
+  workflow_dispatch:
+    inputs:
+      org:
+        description: "Organización de GitHub"
+        required: true
+        default: "CCAPITAL-APPS"
+      topic:
+        description: "Topic para filtrar repos"
+        required: true
+        default: "tribu-canal-digital"
+      from_date:
+        description: "Fecha inicial (YYYY-MM-DD), opcional"
+        required: false
+      to_date:
+        description: "Fecha final (YYYY-MM-DD), opcional"
+        required: false
+
+env:
+  GH_ORG: ${{ github.event.inputs.org }}
+  GH_TOPIC: ${{ github.event.inputs.topic }}
+  SHARDS: 10
+  FROM_DATE: ${{ github.event.inputs.from_date }}
+  TO_DATE: ${{ github.event.inputs.to_date }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Job 0: Genera el token de GitHub App
+  # ──────────────────────────────────────────────────────────
+  generate-token:
+    runs-on: ubuntu-latest
+    outputs:
+      token: ${{ steps.app-token.outputs.token }}
+    steps:
+      - name: Generar token de GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.event.inputs.org }}
+
+  # ──────────────────────────────────────────────────────────
+  # Job 1: Genera la matriz de shards
+  # ──────────────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Generar matriz de shards
+        id: set-matrix
+        run: |
+          SHARDS=${{ env.SHARDS }}
+          MATRIX=$(python3 -c "import json; print(json.dumps(list(range(1, int('$SHARDS') + 1))))")
+          echo "matrix={\"shard_id\":$MATRIX}" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────
+  # Job 2: Deployment Frequency (cada shard procesa un subset de repos)
+  # ──────────────────────────────────────────────────────────
+  deployment-frequency:
+    needs: [prepare, generate-token]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ needs.generate-token.outputs.token }}
+      SHARD_ID: ${{ matrix.shard_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pandas
+      - name: "Shard ${{ matrix.shard_id }} — Deployment Frequency"
+        run: python scripts/deployment_frequency.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: df-shard-${{ matrix.shard_id }}
+          path: "deploy_freq_shard_*.csv"
+          retention-days: 5
+
+  # ──────────────────────────────────────────────────────────
+  # Job 3: Lead Time for Changes
+  # ──────────────────────────────────────────────────────────
+  lead-time:
+    needs: [prepare, generate-token]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ needs.generate-token.outputs.token }}
+      SHARD_ID: ${{ matrix.shard_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pandas
+      - name: "Shard ${{ matrix.shard_id }} — Lead Time"
+        run: python scripts/lead_time.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lt-shard-${{ matrix.shard_id }}
+          path: "lead_time_shard_*.csv"
+          retention-days: 5
+
+  # ──────────────────────────────────────────────────────────
+  # Job 4: Change Failure Rate
+  # ──────────────────────────────────────────────────────────
+  change-failure-rate:
+    needs: [prepare, generate-token]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ needs.generate-token.outputs.token }}
+      SHARD_ID: ${{ matrix.shard_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pandas
+      - name: "Shard ${{ matrix.shard_id }} — Change Failure Rate"
+        run: python scripts/change_failure_rate.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfr-shard-${{ matrix.shard_id }}
+          path: "cfr_shard_*.csv"
+          retention-days: 5
+
+  # ──────────────────────────────────────────────────────────
+  # Job 5: Mean Time to Recovery
+  # ──────────────────────────────────────────────────────────
+  mttr:
+    needs: [prepare, generate-token]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ needs.generate-token.outputs.token }}
+      SHARD_ID: ${{ matrix.shard_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install requests pandas
+      - name: "Shard ${{ matrix.shard_id }} — MTTR"
+        run: python scripts/mttr.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mttr-shard-${{ matrix.shard_id }}
+          path: "mttr_shard_*.csv"
+          retention-days: 5
+
+  # ──────────────────────────────────────────────────────────
+  # Job 6: Consolida todo en reportes finales
+  # ──────────────────────────────────────────────────────────
+  merge:
+    needs: [deployment-frequency, lead-time, change-failure-rate, mttr]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descargar todos los artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{df,lt,cfr,mttr}-shard-*"
+          merge-multiple: true
+
+      - run: pip install pandas
+
+      - name: Consolidar métricas DORA
+        run: python scripts/merge_shards.py
+
+      - name: Subir reportes finales
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-metrics-report
+          path: |
+            dora_deployment_frequency.csv
+            dora_lead_time.csv
+            dora_change_failure_rate.csv
+            dora_mttr.csv
+            dora_summary.csv
+          retention-days: 30
